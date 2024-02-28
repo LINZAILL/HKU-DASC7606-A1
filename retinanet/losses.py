@@ -6,8 +6,7 @@ def calc_iou(a, b):
     ###################################################################
     # TODO: Please modify and fill the codes below to calculate the iou of the two boxes a and b
     ###################################################################
-    #area = (b[:, 2] - b[:, 0]) * (b[:, 3] - b[:, 1])
-    area = 
+    area = (b[:, 2] - b[:, 0]) * (b[:, 3] - b[:, 1]) 
 
     iw = torch.min(torch.unsqueeze(a[:, 2], dim=1), b[:, 2]) - torch.max(torch.unsqueeze(a[:, 0], 1), b[:, 0])
     ih = torch.min(torch.unsqueeze(a[:, 3], dim=1), b[:, 3]) - torch.max(torch.unsqueeze(a[:, 1], 1), b[:, 1])
