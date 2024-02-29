@@ -14,6 +14,7 @@ from retinanet.dataloader import CocoDataset, collater, Resizer, \
 from retinanet.eval import Evaluation
     
 from torch.utils.data import DataLoader
+from ranger import Ranger
 
 def main(args=None):
     parser = argparse.ArgumentParser(description='Simple training script for training a RetinaNet network.')
@@ -54,7 +55,8 @@ def main(args=None):
             retinanet = retinanet.cuda()
 
     retinanet.training = True
-    optimizer = optim.Adam(retinanet.parameters(), lr=1e-4)
+    #optimizer = optim.Adam(retinanet.parameters(), lr=1e-4)
+    optimizer = Ranger(retinanet.parameters(), lr=1e-4)
 
     scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[48, 64])
 
