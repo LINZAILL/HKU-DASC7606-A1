@@ -1,184 +1,249 @@
-import numpy as np
-import torch
-import torch.nn as nn
+"""
+Copyright 2017-2018 Fizyr (https://fizyr.com)
 
-def calc_iou(a, b):
-    ###################################################################
-    # TODO: Please modify and fill the codes below to calculate the iou of the two boxes a and b
-    ###################################################################
-    area = (b[:, 2] - b[:, 0]) * (b[:, 3] - b[:, 1]) 
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
 
-    iw = torch.min(torch.unsqueeze(a[:, 2], dim=1), b[:, 2]) - torch.max(torch.unsqueeze(a[:, 0], 1), b[:, 0])
-    ih = torch.min(torch.unsqueeze(a[:, 3], dim=1), b[:, 3]) - torch.max(torch.unsqueeze(a[:, 1], 1), b[:, 1])
+    http://www.apache.org/licenses/LICENSE-2.0
 
-    iw = torch.clamp(iw, min=0)
-    ih = torch.clamp(ih, min=0)
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
 
-    ua = torch.unsqueeze((a[:, 2] - a[:, 0]) * (a[:, 3] - a[:, 1]), dim=1) + area - iw * ih
+import tensorflow as tf
+from tensorflow import keras
 
-    intersection = iw * ih
 
-    ##################################################################
+def focal(alpha=0.25, gamma=2.0, cutoff=0.5, sigma_var=None):
+    """ Create a functor for computing the focal loss.
 
-    ua = torch.clamp(ua, min=1e-8)
+    Args
+        alpha: Scale the focal weight with alpha.
+        gamma: Take the power of the focal weight with gamma.
+        cutoff: Positive prediction cutoff for soft targets
 
-    IoU = intersection / ua
+    Returns
+        A functor that computes the focal loss using the alpha and gamma.
+    """
+    if sigma_var is None:
+        sigma_var = tf.Variable(dtype=tf.float32, name="sigma_sq_focal",
+                                initial_value=tf.constant_initializer(0)
+                                .__call__(shape=[], dtype=tf.float32),
+                                trainable=True)
 
-    return IoU
+    def _focal(y_true, y_pred):
+        """ Compute the focal loss given the target tensor and the predicted tensor.
 
-class FocalLoss(nn.Module):
+        As defined in https://arxiv.org/abs/1708.02002
 
-    def forward(self, classifications, regressions, anchors, annotations):
-        alpha = 0.25
-        gamma = 2.0
-        batch_size = classifications.shape[0]
-        classification_losses = []
-        regression_losses = []
+        Args
+            y_true: Tensor of target data from the generator with shape (B, N, num_classes).
+            y_pred: Tensor of predicted data from the network with shape (B, N, num_classes).
 
-        anchor = anchors[0, :, :]
+        Returns
+            The focal loss of y_pred w.r.t. y_true.
+        """
+        labels = y_true[:, :, :-1]
+        anchor_state = y_true[:, :, -1]  # -1 for ignore, 0 for background, 1 for object
+        classification = y_pred
 
-        anchor_widths  = anchor[:, 2] - anchor[:, 0]
-        anchor_heights = anchor[:, 3] - anchor[:, 1]
-        anchor_ctr_x   = anchor[:, 0] + 0.5 * anchor_widths
-        anchor_ctr_y   = anchor[:, 1] + 0.5 * anchor_heights
+        # filter out "ignore" anchors
+        indices = tf.where(keras.backend.not_equal(anchor_state, -1))
+        labels = tf.gather_nd(labels, indices)
+        classification = tf.gather_nd(classification, indices)
 
-        for j in range(batch_size):
+        # compute the focal loss
+        alpha_factor = keras.backend.ones_like(labels) * alpha
+        alpha_factor = tf.where(keras.backend.greater(labels, cutoff), alpha_factor, alpha_factor)
 
-            classification = classifications[j, :, :]
-            regression = regressions[j, :, :]
+        focal_weight = tf.where(keras.backend.equal(labels, 1),
+                                     1 - classification ** keras.backend.exp(-sigma_var) * keras.backend.exp(
+                                    -0.5 * sigma_var),
+                                     classification ** keras.backend.exp(-sigma_var) * keras.backend.exp(
+                                    -0.5 * sigma_var))
+        
+        focal_weight = alpha_factor * focal_weight ** gamma
 
-            bbox_annotation = annotations[j, :, :]
-            bbox_annotation = bbox_annotation[bbox_annotation[:, 4] != -1]
+        cross_entropy = keras.backend.binary_crossentropy(labels, classification) * keras.backend.exp(
+            -sigma_var) + sigma_var / 2.0
 
-            classification = torch.clamp(classification, 1e-4, 1.0 - 1e-4)
 
-            if bbox_annotation.shape[0] == 0:
-                if torch.cuda.is_available():
-                    alpha_factor = torch.ones(classification.shape).cuda() * alpha
+        cls_loss = focal_weight * cross_entropy
 
-                    alpha_factor = 1. - alpha_factor
-                    focal_weight = classification
-                    focal_weight = alpha_factor * torch.pow(focal_weight, gamma)
+        # compute the normalizer: the number of positive anchors
+        normalizer = tf.where(keras.backend.equal(anchor_state, 1))
+        normalizer = keras.backend.cast(keras.backend.shape(normalizer)[0], keras.backend.floatx())
+        normalizer = keras.backend.maximum(keras.backend.cast_to_floatx(1.0), normalizer)
 
-                    bce = -(torch.log(1.0 - classification))
+        return keras.backend.sum(cls_loss) / normalizer
 
-                    # cls_loss = focal_weight * torch.pow(bce, gamma)
-                    cls_loss = focal_weight * bce
-                    classification_losses.append(cls_loss.sum())
-                    regression_losses.append(torch.tensor(0).float().cuda())
+    return _focal, sigma_var
 
-                else:
-                    alpha_factor = torch.ones(classification.shape) * alpha
 
-                    alpha_factor = 1. - alpha_factor
-                    focal_weight = classification
-                    focal_weight = alpha_factor * torch.pow(focal_weight, gamma)
+def smooth_l1(sigma=3.0, sigma_var=None):
+    """ Create a smooth L1 loss functor.
 
-                    bce = -(torch.log(1.0 - classification))
+    Args
+        sigma: This argument defines the point where the loss changes from L2 to L1.
 
-                    # cls_loss = focal_weight * torch.pow(bce, gamma)
-                    cls_loss = focal_weight * bce
-                    classification_losses.append(cls_loss.sum())
-                    regression_losses.append(torch.tensor(0).float())
+    Returns
+        A functor for computing the smooth L1 loss given target data and predicted data.
+    """
+    sigma_squared = sigma ** 2
+    if sigma_var is None:
+        sigma_var = tf.Variable(dtype=tf.float32, name="sigma_sq_smooth_l1",
+                                initial_value=tf.constant_initializer(0)
+                                .__call__(shape=[], dtype=tf.float32),
+                                trainable=True)
 
-                continue
+    def _smooth_l1(y_true, y_pred):
+        """ Compute the smooth L1 loss of y_pred w.r.t. y_true.
 
-            IoU = calc_iou(anchors[0, :, :], bbox_annotation[:, :4]) # num_anchors x num_annotations
+        Args
+            y_true: Tensor from the generator of shape (B, N, 5). The last value for each box is the state of the anchor (ignore, negative, positive).
+            y_pred: Tensor from the network of shape (B, N, 4).
 
-            IoU_max, IoU_argmax = torch.max(IoU, dim=1) # num_anchors x 1
+        Returns
+            The smooth L1 loss of y_pred w.r.t. y_true.
+        """
+        # separate target and state
+        regression = y_pred
+        regression_target = y_true[:, :, :-1]
+        anchor_state = y_true[:, :, -1]
 
-            # compute the loss for classification
-            targets = torch.ones(classification.shape) * -1
+        # filter out "ignore" anchors
+        indices = tf.where(keras.backend.equal(anchor_state, 1))
+        regression = tf.gather_nd(regression, indices)
+        regression_target = tf.gather_nd(regression_target, indices)
 
-            if torch.cuda.is_available():
-                targets = targets.cuda()
-
-            targets[torch.lt(IoU_max, 0.4), :] = 0
-
-            positive_indices = torch.ge(IoU_max, 0.5)
-
-            num_positive_anchors = positive_indices.sum()
-
-            assigned_annotations = bbox_annotation[IoU_argmax, :]
-
-            targets[positive_indices, :] = 0
-            targets[positive_indices, assigned_annotations[positive_indices, 4].long()] = 1
-
-            if torch.cuda.is_available():
-                alpha_factor = torch.ones(targets.shape).cuda() * alpha
-            else:
-                alpha_factor = torch.ones(targets.shape) * alpha
-
-            alpha_factor = torch.where(torch.eq(targets, 1.), alpha_factor, 1. - alpha_factor)
-            focal_weight = torch.where(torch.eq(targets, 1.), 1. - classification, classification)
-
-            ###################################################################
-            # TODO: Please substitute the "?" to calculate Focal Loss
-            ##################################################################
-            
-            focal_weight = alpha_factor * torch.pow(focal_weight, gamma)
-
-            bce = -(targets * torch.log(classification) + (1.0 - targets) * torch.log(1.0 - classification))
-
-            cls_loss = focal_weight * bce
-
-            ##################################################################
-
-            if torch.cuda.is_available():
-                cls_loss = torch.where(torch.ne(targets, -1.0), cls_loss, torch.zeros(cls_loss.shape).cuda())
-            else:
-                cls_loss = torch.where(torch.ne(targets, -1.0), cls_loss, torch.zeros(cls_loss.shape))
-
-            classification_losses.append(cls_loss.sum()/torch.clamp(num_positive_anchors.float(), min=1.0))
-
-            # compute the loss for regression
-
-            if positive_indices.sum() > 0:
-                assigned_annotations = assigned_annotations[positive_indices, :]
-
-                anchor_widths_pi = anchor_widths[positive_indices]
-                anchor_heights_pi = anchor_heights[positive_indices]
-                anchor_ctr_x_pi = anchor_ctr_x[positive_indices]
-                anchor_ctr_y_pi = anchor_ctr_y[positive_indices]
-
-                gt_widths  = assigned_annotations[:, 2] - assigned_annotations[:, 0]
-                gt_heights = assigned_annotations[:, 3] - assigned_annotations[:, 1]
-                gt_ctr_x   = assigned_annotations[:, 0] + 0.5 * gt_widths
-                gt_ctr_y   = assigned_annotations[:, 1] + 0.5 * gt_heights
-
-                # clip widths to 1
-                gt_widths  = torch.clamp(gt_widths, min=1)
-                gt_heights = torch.clamp(gt_heights, min=1)
-
-                targets_dx = (gt_ctr_x - anchor_ctr_x_pi) / anchor_widths_pi
-                targets_dy = (gt_ctr_y - anchor_ctr_y_pi) / anchor_heights_pi
-                targets_dw = torch.log(gt_widths / anchor_widths_pi)
-                targets_dh = torch.log(gt_heights / anchor_heights_pi)
-
-                targets = torch.stack((targets_dx, targets_dy, targets_dw, targets_dh))
-                targets = targets.t()
-
-                if torch.cuda.is_available():
-                    targets = targets/torch.Tensor([[0.1, 0.1, 0.2, 0.2]]).cuda()
-                else:
-                    targets = targets/torch.Tensor([[0.1, 0.1, 0.2, 0.2]])
-
-                negative_indices = 1 + (~positive_indices)
-
-                regression_diff = torch.abs(targets - regression[positive_indices, :])
-
-                regression_loss = torch.where(
-                    torch.le(regression_diff, 1.0 / 9.0),
-                    0.5 * 9.0 * torch.pow(regression_diff, 2),
-                    regression_diff - 0.5 / 9.0
+        # compute smooth L1 loss
+        # f(x) = 0.5 * (sigma * x)^2          if |x| < 1 / sigma / sigma
+        #        |x| - 0.5 / sigma / sigma    otherwise
+        factor = 1.0 / (2.0 * keras.backend.exp(sigma_var))
+        regression_diff = regression - regression_target
+        regression_diff = keras.backend.abs(regression_diff)
+        regression_loss = tf.where(
+            keras.backend.less(regression_diff, 1.0 / sigma_squared),
+            factor * keras.backend.pow(regression_diff, 2) + 0.5 * sigma_var,
+            - 1.0 / sigma_squared * keras.backend.log(
+                1.0 - tf.math.erf(
+                    keras.backend.sqrt(factor) / sigma_squared
                 )
-                regression_losses.append(regression_loss.mean())
-            else:
-                if torch.cuda.is_available():
-                    regression_losses.append(torch.tensor(0).float().cuda())
-                else:
-                    regression_losses.append(torch.tensor(0).float())
+            ) * regression_diff
+            + keras.backend.log(
+                1.0 - tf.math.erf(
+                    keras.backend.sqrt(factor) / sigma_squared
+                )
+            )
+            + factor / (sigma_squared ** 2.0)
+            + 0.5 * sigma_var
+        )
 
-        return torch.stack(classification_losses).mean(dim=0, keepdim=True), torch.stack(regression_losses).mean(dim=0, keepdim=True)
+        # compute the normalizer: the number of positive anchors
+        normalizer = keras.backend.maximum(1, keras.backend.shape(indices)[0])
+        normalizer = keras.backend.cast(normalizer, dtype=keras.backend.floatx())
+        return keras.backend.sum(regression_loss) / normalizer
 
+    return _smooth_l1, sigma_var
+
+
+def adjust_smooth_l1(scalars=[4, 0.1, 1. /9],
+                    weights=[None, None, None]):
+    """ Create a smooth L1 loss functor.
+
+    Args
+        beta: This argument defines the point where the loss changes from L2 to L1.
+
+    Returns
+        A functor for computing the smooth L1 loss given target data and predicted data.
+    """
+    # global num_features, momentum, beta
+    num_features, momentum, beta = scalars
+    # global running_mean, running_var, sigma_var 
+    running_mean, running_var, sigma_var = weights = weights
+    if sigma_var is None:
+        sigma_var = tf.Variable(dtype=tf.float32, name="sigma_sq_smooth_l1",
+                                initial_value=tf.constant_initializer(0)
+                                .__call__(shape=[], dtype=tf.float32),
+                                trainable=True)  
+    if running_mean is None:
+        running_mean = tf.Variable(dtype=tf.float32, name="running_mean_smooth_l1",
+                                initial_value=tf.constant_initializer(beta)
+                                .__call__(shape=[num_features], dtype=tf.float32),
+                                trainable=False)                   
+    if running_var is None: 
+        running_var = tf.Variable(dtype=tf.float32, name="running_var_smooth_l1",
+                                initial_value=tf.constant_initializer(0)
+                                .__call__(shape=[num_features], dtype=tf.float32),
+                                trainable=False)                                                         
+
+    def _adjust_smooth_l1(y_true, y_pred):
+        """ Compute the smooth L1 loss of y_pred w.r.t. y_true.
+
+        Args
+            y_true: Tensor from the generator of shape (B, N, 5). The last value for each box is the state of the anchor (ignore, negative, positive).
+            y_pred: Tensor from the network of shape (B, N, 4).
+
+        Returns
+            The smooth L1 loss of y_pred w.r.t. y_true.
+        """         
+        # separate target and state
+        nonlocal running_mean, running_var, num_features, momentum, beta
+        regression = y_pred
+        regression_target = y_true[:, :, :-1]
+        anchor_state = y_true[:, :, -1]
+
+        # filter out "ignore" anchors
+        indices = tf.where(keras.backend.equal(anchor_state, 1))
+        regression = tf.gather_nd(regression, indices)
+        regression_target = tf.gather_nd(regression_target, indices)
+
+        # compute smooth L1 loss
+        # f(x) = 0.5 * (sigma * x)^2          if |x| < 1 / sigma / sigma
+        #        |x| - 0.5 / sigma / sigma    otherwise
+        factor = 1.0 / (2.0 * keras.backend.exp(sigma_var))
+        regression_diff = regression - regression_target
+        regression_diff = keras.backend.abs(regression_diff)
+
+        _running_mean = running_mean * (1 - momentum)
+        _running_mean += (momentum * keras.backend.mean(regression_diff, axis=0))
+        _running_var = running_var * (1 - momentum)
+        _running_var += (momentum * keras.backend.var(regression_diff, axis=0))
+
+
+        beta = (_running_mean - _running_var)
+        beta = tf.clip_by_value(beta, 1e-3, beta)
+       
+        running_mean.assign(_running_mean)              
+    
+        running_var.assign(_running_var)
+
+        sigma_squared = 1.0 / beta
+        regression_loss = tf.where(
+            keras.backend.less(regression_diff, 1.0 / sigma_squared),
+            factor * keras.backend.pow(regression_diff, 2) + 0.5 * sigma_var,
+            - 1.0 / sigma_squared * keras.backend.log(
+                1.0 - tf.math.erf(
+                    keras.backend.sqrt(factor) / sigma_squared
+                )
+            ) * regression_diff
+            + keras.backend.log(
+                1.0 - tf.math.erf(
+                    keras.backend.sqrt(factor) / sigma_squared
+                )
+            )
+            + factor / (sigma_squared ** 2.0)
+            + 0.5 * sigma_var
+        )
+
+        # compute the normalizer: the number of positive anchors
+        normalizer = keras.backend.maximum(1, keras.backend.shape(indices)[0])
+        normalizer = keras.backend.cast(normalizer, dtype=keras.backend.floatx())
+        return keras.backend.sum(regression_loss) / normalizer
+
+    return _adjust_smooth_l1, sigma_var, running_mean, running_var
 
